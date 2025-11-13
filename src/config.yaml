@@ -1,0 +1,46 @@
+# ===========================================
+# LMCache multi-tier configuration
+# ===========================================
+
+# General settings
+chunk_size: 256
+enable_controller: True
+lmcache_instance_id: "lmcache_instance"
+
+# ------------------------------
+# Tier 1: Local CPU RAM backend
+# ------------------------------
+local_cpu: True
+max_local_cpu_size: 5  # in GB
+
+# ------------------------------
+# Tier 2: Local disk backend
+# ------------------------------
+local_disk:
+  enable: True
+  root_dir: "/tmp/lmcache_disk"   # path to store serialized KV blocks
+  max_disk_size_gb: 50
+  eviction_policy: "lru"
+
+# ------------------------------
+# Tier 3: Remote (Fake Redis) backend
+# ------------------------------
+remote_storage:
+  enable: True
+  type: "redis"
+  redis_host: "localhost"
+  redis_port: 6379
+  redis_db: 0
+  ttl_seconds: 86400   # optional TTL for long-term storage (1 day)
+  fake_mode: True      # if True, simulate Redis locally for testing
+
+# ------------------------------
+# Cache controller + workers
+# ------------------------------
+controller_pull_url: "localhost:9001"
+lmcache_worker_ports: 8001
+p2p_host: "localhost"
+p2p_init_ports: 8200
+
+# Optional logging/debugging
+log_level: "INFO"

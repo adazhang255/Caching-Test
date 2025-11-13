@@ -1,0 +1,18 @@
+chunk_size: 256
+
+local_cpu:
+  enabled: true
+  max_size_gb: 6.0   # HOT tier
+
+local_disk:
+  path: "/mnt/lmcache_warm"   # WARM tier
+  max_size_gb: 60.0
+
+remote_backend:
+  type: external
+  module: "lmcache_s3_backend"
+  class: "S3StorageBackend"
+  kwargs:
+    bucket: "my-lmcache-bucket"
+    prefix: "kv_cold/"
+    default_ttl_seconds: 259200  # 3 days
