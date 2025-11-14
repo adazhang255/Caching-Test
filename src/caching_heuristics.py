@@ -1,80 +1,94 @@
-import time
-from cache_controller import LMCacheController 
+"""TTL and backend selection heuristics for LMCache experiments.
 
-class Prompt:
-    def __init__(self, key, output_size, perplexity, timestamp=None, version=1):
-        self.key = key
-        self.output_size = output_size
-        self.perplexity = perplexity
-        self.timestamp = timestamp or time.time()
-        self.version = version
-        self.access_history = []
+This module exposes compute_ttl(...) and select_backend(...) functions which
+map prompt metadata (perplexity, time_variance, access_count, size, cost)
+into a TTL (seconds) and a suggested storage backend name. The functions are
+kept small and configurable so you can iterate on formulas quickly.
+"""
 
-    # --- Access Tracking --- 
-    def accessed(self):
-        """Record an access timestamp"""
-        self.access_history.append(time.time())
+from typing import Dict, Any
+import math
 
-    def access_count_last_hour(self):
-        """Return how many times this prompt was accessed in the last hour"""
-        cutoff = time.time() - 3600
-        self.access_history = [t for t in self.access_history if t >= cutoff]
-        return len(self.access_history)
 
-# --- Heuristic Functions ---
+def clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
 
-def get_TTL(prompt, perplexity, time_variant=False):
-    if (perplexity < 40):
-        return {"TTL":60, "backend": "GPU"}
-    elif (time_variant or perplexity < 40):
-        return {"TTL": 600, "backend": "disk"}
-    else:
-        return {"TTL": 60 * 24, "backend": "redis"}
-    
-def set_TTL(prompt, TTL, new_backend):
 
-    controller = LMCacheController()
-    tokens = controller.tokenize(prompt)
-    curr_backend = controller.lookup(tokens)["lmcache_default_instance"][0]
-    
-    controller.move(["lmcache_instance", curr_backend], ["lmcache_instance", new_backend])
-    # TODO: instead call redis/backend functionality
-    new_backend.expire(TTL)
-    
+def compute_ttl(metadata: Dict[str, Any],
+                base_ttl: int = 3600,
+                min_ttl: int = 30,
+                max_ttl: int = 7 * 24 * 3600,
+                alpha: float = 0.25):
+    """Compute TTL in seconds based on metadata.
 
-def is_hot_candidate(prompt, active_session=True, ttl_limit_minutes=10):
+    metadata keys used (optional):
+      - perplexity: float (higher -> likely more unique -> longer TTL?)
+      - access_count: int (more accesses -> increase TTL)
+      - time_variance: float in [0..1] (higher variance -> reduce TTL)
+
+    Formula (starter):
+      ttl = base_ttl * (1 + alpha * log(1+access_count)) * (1 + beta * cost_factor) * (1 - gamma*time_variance)
+
+    The function clamps results to [min_ttl, max_ttl].
     """
-    Hot cache heuristic:
-    - Frequent, time-variant prompts
-    - Active user session
-    - TTL < 10 min
-    """
-    return active_session and (time.time() - prompt.timestamp < ttl_limit_minutes * 60)
 
-def is_warm_candidate(prompt, min_accesses=2, min_output_size=100, perplexity_range=(20, 40)):
-    """
-    Warm cache heuristic:
-    - Prompt accessed ≥2x in past hour
-    - Output > threshold
-    - Moderate perplexity (20-40)
-    """
-    return (prompt.access_count_last_hour() >= min_accesses and
-            prompt.output_size >= min_output_size and
-            perplexity_range[0] <= prompt.perplexity <= perplexity_range[1])
+    perplexity = float(metadata.get("perplexity", 1.0))
+    access_count = int(metadata.get("access_count", 0))
+    time_variance = float(metadata.get("time_variance", 0.0))
 
-def is_long_term_candidate(prompt, deterministic=True, time_invariant=True):
-    """
-    Long-term cache heuristic:
-    - Deterministic and static
-    - No expected update triggers
-    """
-    return deterministic and time_invariant
+    # access influence (log-smooth)
+    access_influence = 1.0 + alpha * math.log1p(access_count)
 
-# --- Example Usage ---
-prompt1 = Prompt("last_week_bill", output_size=50, perplexity=25)
-prompt1.accessed()
-prompt1.accessed()  # accessed twice in last hour
+    # perplexity influence: by default, higher perplexity indicates more surprising
+    # outputs — we may want to keep them longer (multiply factor). scale modestly.
+    perplexity_factor = 1.0 + (max(0.0, perplexity - 10.0) / 100.0)
 
-print("Hot candidate:", is_hot_candidate(prompt1, active_session=True))
-print("Warm candidate:", is_warm_candidate(prompt1))
-print("Long-term candidate:", is_long_term_candidate(prompt1))
+    # time_variance penalizes TTL (if high volatility, lower TTL)
+    gamma = 0.8
+
+    ttl = base_ttl * access_influence * perplexity_factor * (1.0 - gamma * clamp(time_variance, 0.0, 1.0))
+
+    ttl = int(clamp(ttl, min_ttl, max_ttl))
+    return ttl
+
+
+def select_backend(metadata: Dict[str, Any],
+                   hot_threshold_perplexity: float = 20.0,
+                   recent_seconds: int = 3600) -> str:
+    """Decide a preferred backend name for new or promoted entries.
+
+    Return values (suggested): "gpu" (hot), "disk" (warm), "remote" (cold)
+    The decision uses perplexity, recent access and time_variance.
+    """
+
+    perplexity = float(metadata.get("perplexity", 0.0))
+    access_count = int(metadata.get("access_count", 0))
+    last_accessed = float(metadata.get("last_accessed", 0.0))
+    time_variance = float(metadata.get("time_variance", 0.0))
+
+    now = metadata.get("now", None)
+    # simple recency check if 'now' provided
+    recency_score = 0
+    if now and last_accessed:
+        recency_score = max(0, now - last_accessed)
+
+    # Heuristic rules (starter):
+    # - Very low perplexity and recent accesses => keep in GPU (hot)
+    # - Moderate perplexity or moderate recency => disk
+    # - High perplexity and/or low recency => remote
+
+    if perplexity <= hot_threshold_perplexity and access_count >= 2 and (now is None or recency_score <= recent_seconds):
+        return "gpu"
+
+    if time_variance > 0.7:
+        # volatile prompts shouldn't occupy hot GPU
+        return "disk"
+
+    if perplexity > (hot_threshold_perplexity * 2.0):
+        return "remote"
+
+    # default fallback
+    return "disk"
+
+
+__all__ = ["compute_ttl", "select_backend"]
