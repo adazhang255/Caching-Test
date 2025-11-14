@@ -35,7 +35,7 @@ You can experiment with several families of TTL heuristics. Each heuristic imple
 
 Suggested adaptive TTL formula (starter):
 
-TTL = clamp(base_ttl * (1 + alpha * access_count) * (1 + beta * cost_tokens/100), min_ttl, max_ttl)
+TTL = clamp(base_ttl * (1 + alpha * access_count), min_ttl, max_ttl)
 
 Tune alpha/beta to control sensitivity to reuse and cost.
 
