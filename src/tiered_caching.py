@@ -1,7 +1,9 @@
 import time
 import pickle
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
+
+from caching_heuristics import compute_ttl, select_backend
 
 # Use fakeredis for testing/dev instead of a real Redis server.
 try:
@@ -126,72 +128,97 @@ class RemoteBackend(BaseBackend):
 # Multi-Tier TTL-Aware Cache
 # -----------------------------
 
- # TODO: maybe get rid of class altogether?
 class MultiTierCache:
-    def __init__(self, tiers):
+    """Manages multi-tier KV cache placement via LMCache controller.
+    
+    After each LLM generation, applies TTL heuristics to decide if/where
+    to move KV tensors between storage backends (GPU, disk, remote).
+    """
+    
+    def __init__(self, lmcache_controller, llm=None):
         """
-        tiers: list of tuples (backend_instance, ttl_seconds)
-               highest-priority first
+        Args:
+            lmcache_controller: LMCacheController instance (manages KV placement)
+            llm: vLLM model instance (for generation). Can be set later.
         """
-        self.tiers = tiers
+        self.controller = lmcache_controller
+        self.llm = llm
+        self.access_count = {}  # track prompt accesses for heuristics
 
-   #TODO: definitely set to cache controller instead
-    def get(self, key, llm_fn=None):
-        """Retrieve value from tiers, optionally computing via LLM if missing"""
-        for i, (backend, ttl) in enumerate(self.tiers):
-            val = backend.get(key)
-            if val is not None:
-                # Promote to higher tiers
-                for j in range(i):
-                    self.tiers[j][0].set(key, val, self.tiers[j][1])
-                return val
+    def set_llm(self, llm):
+        """Set the LLM instance (useful if not available at init time)."""
+        self.llm = llm
 
-        # Cache miss: compute if llm_fn is provided
-        if llm_fn is not None:
-            result = llm_fn(key)
-            # Store in all tiers
-            for backend, ttl in self.tiers:
-                backend.set(key, result, ttl)
-            return result
-        return None
+    def generate_and_manage(self, prompt, sampling_params, metadata=None):
+        """Generate with vLLM and automatically apply TTL heuristics.
+        
+        Args:
+            prompt: Input text
+            sampling_params: vLLM SamplingParams
+            metadata: Dict with keys like perplexity, time_variance
+                     If not provided, defaults are used.
+        
+        Returns:
+            Generated text output
+        """
+        if self.llm is None:
+            raise RuntimeError("LLM not set. Call set_llm() or pass to __init__")
+        
+        # Default metadata if not provided
+        if metadata is None:
+            metadata = {
+                "perplexity": 10.0,
+                "time_variance": 0.1
+            }
+        
+        # Track access count for this prompt
+        prompt_hash = hash(prompt)
+        self.access_count[prompt_hash] = self.access_count.get(prompt_hash, 0) + 1
+        metadata["access_count"] = self.access_count[prompt_hash]
+        
+        # Generate (LMCache automatically stores KV tensors)
+        outputs = self.llm.generate([prompt], sampling_params)
+        output_text = outputs[0].outputs[0].text
+        
+        # After generation, apply TTL heuristics and move KV if needed
+        self._apply_heuristics_and_move(prompt, metadata)
+        
+        return output_text
 
-    def set(self, key, value):
-        """Set value in all tiers with respective TTLs"""
-        for backend, ttl in self.tiers:
-            backend.set(key, value, ttl)
-
-    def delete(self, key):
-        for backend, _ in self.tiers:
-            backend.delete(key)
-
-
-# -----------------------------
-# Example Usage with LLM
-# -----------------------------
-
-#TODO: import GEmma 3 279m, and change things about it
-# Simulated LLM function
-def fake_llm(prompt):
-    # In reality, this would call vLLM
-    return f"LLM response to: {prompt}"
-
-# Initialize tiers
-# TODO: LMCache initialzie tiers via config, get rid of here
-hot = InMemoryBackend()
-warm = LocalDiskBackend()
-cold = RemoteBackend()
-
-cache = MultiTierCache([
-    (hot, 10),        # 10s TTL for hot
-    (warm, 60),       # 1 min TTL for warm
-    (cold, 3600)      # 1 hr TTL for cold
-])
-
-# Test flow
-prompt = "What is the weather today?"
-print("First query (compute):", cache.get(prompt, llm_fn=fake_llm))
-time.sleep(2)
-print("Second query (should hit hot):", cache.get(prompt))
-time.sleep(12)
-print("Third query (hot expired, should hit warm):", cache.get(prompt))
-
+    def _apply_heuristics_and_move(self, prompt, metadata):
+        """Query LMCache, compute TTL/backend heuristics, and move KV if needed.
+        
+        This is called automatically after each generation.
+        """
+        try:
+            # Step 1: Tokenize and lookup current KV location
+            tokens = self.controller.tokenize(prompt)
+            current_layout = self.controller.lookup(tokens)
+            
+            if not current_layout.get("found"):
+                # KV not yet cached (shouldn't happen after generate, but handle gracefully)
+                return
+            
+            current_backend = current_layout.get("lmcache_default_instance", [None])[0]
+            
+            # Step 2: Compute TTL and preferred backend based on heuristics
+            ttl = compute_ttl(metadata)
+            preferred_backend = select_backend(metadata)
+            
+            # Step 3: Move KV to preferred backend if different
+            if current_backend and preferred_backend and current_backend != preferred_backend:
+                move_result = self.controller.move(
+                    old_position=["lmcache_instance", current_backend],
+                    new_position=["lmcache_instance", preferred_backend]
+                )
+                print(f"✓ Moved KV from {current_backend} to {preferred_backend} (TTL: {ttl}s)")
+                return move_result
+            
+            # Just log the decision if no move needed
+            print(f"✓ KV in {preferred_backend}, TTL: {ttl}s")
+            
+        except Exception as e:
+            # Gracefully handle LMCache server unavailability
+            print(f"⚠️  Heuristic/move failed: {e}")
+            pass
+    
