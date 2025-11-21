@@ -8,20 +8,23 @@ This repository contains experiments and prototype code for integrating Time-To-
 - Integrate heuristics with the LMCache KV cache abstraction so an agent can check the cache before calling a model, update TTLs on access, and asynchronously warm or evict entries.
 - Make it easy to iterate on heuristics (static TTLs, size-aware TTLs, adaptive TTLs based on reuse probability or cost) and measure hit-rate / cost savings.
 
-## Architecture & flow (high level)
+## Architecture
 
-1. The agent receives or generates a prompt.
-2. Agent queries the LMCache KV cache for the prompt key (or normalized key).
-3. If hit: agent receives the cached response and the TTL heuristic may update metadata (e.g., extend TTL or promote entry).
-4. If miss: agent calls the LM, stores the KV tensors into KV cache with an initial TTL computed by the chosen heuristic.
-5. Background processes may warm entries, apply decay, or evict entries when backends fail or storage limits are hit.
+- Agents are ephemeral (stateless). They do orchestration, tool calls, prompt construction only. No model/LMCache in agents.
+- Inference engine is stateful. It hosts the model and LMCache (GPU+Disk only) and exposes HTTP endpoints.
+- LMCache tiers: GPU (hot) + Disk (warm on local NVMe). CPU and remote tiers are disabled. LMCache auto-offloads GPU→Disk (LRU).
+- S3/Glacier archive is external and TTL-managed outside LMCache. A background worker compresses KV and uploads with TTL metadata. On deep miss, the engine fetches from S3 and hydrates GPU LMCache via a hydrate shim.
 
 ## Key files
 
-- `src/caching_heuristics.py` — central heuristics used to compute TTLs / priorities (edit and iterate here).
-- `Multi-Tier Caching/cache_controller.py` — orchestrates cache operations across tiers.
-- `Multi-Tier Caching/lmcache_s3_backend.py` — optional S3-backed backend for persistent K/V storage.
-- `archive/` — quick notebooks and a simple script to exercise caching flows and examples.
+- `src/caching_heuristics.py` — GPU/Disk-only heuristics; no remote.
+- `src/tiered_caching.py` — logs TTL/backend decisions; does not orchestrate moves (LMCache LRU handles GPU→Disk).
+- `src/engine_app.py` — inference engine API skeleton with `/generate`, `/kv/hydrate`, `/kv/lookup`, `/healthz`.
+- `src/engine_lmcache_controller_client.py` — simple controller client + hydrate shim call.
+- `src/engine_serialization.py` — gzip compress/decompress helpers.
+- `src/s3_archive.py` — external TTL archive adapter for S3 (local fallback in dev).
+- `src/workers_archive_worker.py` — background archival worker skeleton.
+- `src/notebook_bootstrap.py` — helper to start/stop the LMCache controller from notebooks.
 
 ## Contract (inputs / outputs)
 
@@ -41,10 +44,8 @@ Tune alpha/beta to control sensitivity to reuse and cost.
 
 ## Integrating with LMCache KV
 
-- Key normalization: derive a stable key from the prompt (hash or canonicalized string) so agent and cache agree.
-- On write: compute TTL via the chosen heuristic and store response with metadata fields: inserted_at, ttl_seconds, access_count=0.
-- On read (hit): increment access_count, update last_accessed, optionally recompute ttl and update the KV entry with new ttl_seconds.
-- On miss: call model, store entry with compute_ttl(...).
+- Agent calls inference engine only. Engine consults LMCache (GPU→Disk). On deep miss, it may fetch from S3 and hydrate GPU via `/kv/hydrate`.
+- LMCache never writes to S3. All TTL stays in S3 metadata or an external index.
 
 Integration pseudocode:
 
@@ -79,3 +80,13 @@ Measure:
 
 Evaluate heuristics on representative workloads (agent logs or simulated prompts). Use notebooks in `notebooks/` to instrument runs and emit CSV/plots.
 
+## Runtime toggles
+
+- `LMCACHE_DISABLE_OFFLOAD` ("0" | "1"): when "1", logging only; LMCache still uses LRU but we don’t orchestrate moves.
+
+## S3 TTL archive
+
+- Use `src/s3_archive.py` for external TTL storage. In dev (no AWS), it falls back to a local folder.
+- Background worker: `src/workers_archive_worker.py` runs periodically to upload entries.
+
+Note: LMCache remote tier is disabled. LMCache never writes to S3; TTL lives entirely in S3 metadata or an external index.

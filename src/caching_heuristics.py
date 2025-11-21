@@ -1,4 +1,4 @@
-"""TTL and backend selection heuristics for LMCache experiments.
+"""TTL and backend selection heuristics for LMCache GPU+Disk only.
 
 This module exposes compute_ttl(...) and select_backend(...) functions which
 map prompt metadata (perplexity, time_variance, access_count, size, cost)
@@ -7,6 +7,7 @@ kept small and configurable so you can iterate on formulas quickly.
 """
 
 from typing import Dict, Any
+import os
 import math
 
 
@@ -16,7 +17,7 @@ def clamp(val: float, lo: float, hi: float) -> float:
 
 def compute_ttl(metadata: Dict[str, Any],
                 base_ttl: int = 3600,
-                min_ttl: int = 30,
+                min_ttl: int = 0,
                 max_ttl: int = 7 * 24 * 3600,
                 alpha: float = 0.25):
     """Compute TTL in seconds based on metadata.
@@ -55,11 +56,14 @@ def compute_ttl(metadata: Dict[str, Any],
 def select_backend(metadata: Dict[str, Any],
                    hot_threshold_perplexity: float = 20.0,
                    recent_seconds: int = 3600) -> str:
-    """Decide a preferred backend name for new or promoted entries.
+    """Decide preferred backend for entries.
 
-    Return values (suggested): "gpu" (hot), "disk" (warm), "remote" (cold)
-    The decision uses perplexity, recent access and time_variance.
+    Only returns "gpu" (hot) or "disk" (warm). Remote is disabled by design.
     """
+
+    # Optional guard: prevent offloading beyond GPU if set.
+    if os.getenv("LMCACHE_DISABLE_OFFLOAD", "0") == "1":
+        return "gpu"
 
     perplexity = float(metadata.get("perplexity", 0.0))
     access_count = int(metadata.get("access_count", 0))
@@ -72,22 +76,16 @@ def select_backend(metadata: Dict[str, Any],
     if now and last_accessed:
         recency_score = max(0, now - last_accessed)
 
-    # Heuristic rules (starter):
-    # - Very low perplexity and recent accesses => keep in GPU (hot)
-    # - Moderate perplexity or moderate recency => disk
-    # - High perplexity and/or low recency => remote
+    # Heuristic rules (GPU+Disk only):
+    # - Hot & recently accessed → gpu
+    # - Volatile or less recent → disk
 
-    if perplexity <= hot_threshold_perplexity and access_count >= 2 and (now is None or recency_score <= recent_seconds):
+    # if perplexity <= hot_threshold_perplexity and access_count >= 2 and (now is None or recency_score <= recent_seconds):
+    #     return "gpu"
+    # return "disk"
+    
+    if compute_ttl(metadata) < 10:
         return "gpu"
-
-    if time_variance > 0.7:
-        # volatile prompts shouldn't occupy hot GPU
-        return "disk"
-
-    if perplexity > (hot_threshold_perplexity * 2.0):
-        return "remote"
-
-    # default fallback
     return "disk"
 
 
