@@ -6,7 +6,7 @@ Client + heuristics for working with an external LMCache controller.
 
 from .cache_controller import LMCacheController
 from .caching_heuristics import compute_ttl, select_backend
-from .tiered_caching import (
+from .multitier_cache import (
     MultiTierCache,
 )
 

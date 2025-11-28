@@ -85,7 +85,7 @@ class LMCacheController:
         
 
     def tokenize(self, prompt: str) -> List[int]:
-        r = requests.post(self.vllm_url, json={"model": self.model, "prompt": prompt})
+        r = requests.post(f"{self.vllm_url}/tokenize", json={"model": self.model, "prompt": prompt})
         r.raise_for_status()
         return r.json()
 
