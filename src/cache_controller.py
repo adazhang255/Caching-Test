@@ -94,8 +94,8 @@ class LMCacheController:
         r.raise_for_status()
         return r.json()
 
-    def move(self, old_position: List[str], new_position: List[str]) -> Dict[str, Any]:
-        r = requests.post(f"{self.url}/move", json={"old_position": old_position, "new_position": new_position})
+    def move(self, old_position: List[str], new_position: List[str], tokens: List[int]) -> Dict[str, Any]:
+        r = requests.post(f"{self.url}/move", json={"old_position": old_position, "new_position": new_position, "tokens": tokens})
         r.raise_for_status()
         return r.json()
 

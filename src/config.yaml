@@ -27,7 +27,7 @@ local_disk:
 # Tier 3: Remote (Fake Redis) backend
 # ------------------------------
 remote_storage:
-  enable: FALSE
+  enable: TRUE
   type: "redis"
   redis_host: "localhost"
   redis_port: 6379

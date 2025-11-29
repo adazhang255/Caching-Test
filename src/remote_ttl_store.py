@@ -37,14 +37,23 @@ class RemoteTTLStore:
 
     def put(self, logical_key: str, payload: str | bytes, ttl_seconds: int, content_type: str = "text/plain") -> Dict[str, Any]:
         key = _sha256(logical_key)
-        now = int(time.time())
-        expires_at = now + int(ttl_seconds)
         blob_path = self._blob_path(key)
 
         self._write_blob(blob_path, payload)
-        meta = {"expires_at": expires_at, "content_type": content_type, "blob_path": blob_path}
-        self.r.set(self._idx_key(key), json.dumps(meta))
-        return {"key": key, **meta}
+        meta = {"content_type": content_type, "blob_path": blob_path}
+        # Let fakeredis/redis manage TTL
+        self.r.set(self._idx_key(key), json.dumps(meta), ex=int(ttl_seconds))
+        return {"key": key, "ttl": int(ttl_seconds), **meta}
+
+    
+    def get_TTL(self, logical_key: str) -> Optional[int]:
+        key = _sha256(logical_key)
+        ttl = self.r.ttl(self._idx_key(key))
+        # redis/fakeredis: -2 = no key, -1 = no expire
+        if ttl is None or ttl < 0:
+            return None
+        return int(ttl)
+
 
     def get_if_fresh(self, logical_key: str) -> Optional[Dict[str, Any]]:
         key = _sha256(logical_key)
@@ -55,14 +64,18 @@ class RemoteTTLStore:
             meta = json.loads(raw)
         except Exception:
             return None
-        now = int(time.time())
-        if now >= int(meta.get("expires_at", 0)):
-            return None
+
         blob_path = meta.get("blob_path")
         if not blob_path or not os.path.exists(blob_path):
             return None
+
         payload = self._read_blob(blob_path)
-        return {"key": key, "payload": payload, "content_type": meta.get("content_type", "text/plain"), "expires_at": meta.get("expires_at")}
+        return {
+            "key": key,
+            "payload": payload,
+            "content_type": meta.get("content_type", "text/plain"),
+        }
+
 
     def delete(self, logical_key: str) -> bool:
         key = _sha256(logical_key)
